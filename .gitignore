@@ -2,3 +2,4 @@ compile
 .vscode/
 WebSocket/
 full.hpp
+server

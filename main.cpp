@@ -10,7 +10,8 @@ void onMessage(int client, const std::string& msg) {
 
 int main() {
 
-    server.start("9002", &onMessage);
+    server.init("9002", &onMessage, true);
+    server.run();
     return 0;
 }
 
