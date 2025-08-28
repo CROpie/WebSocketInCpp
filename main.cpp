@@ -4,7 +4,7 @@ minisocket::Server server;
 
 void onMessage(int client, const std::string& msg) {
     std::cout << "Received from client " << client << ": " << msg << "\n";
-    // You could echo back or process the message here
+
     server.sendFrame(client, "This is some text");
 }
 

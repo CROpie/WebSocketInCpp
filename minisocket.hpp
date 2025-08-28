@@ -1,44 +1,30 @@
+/*
+
+    Minimal server-side websocket implementation using threads to handle multiple clients
+    Requires -lcrypto
+    https://github.com/CROpie/WebSocketInCpp
+
+*/
+
 #pragma once
 
 #include <string>
 #include <vector>
 #include <thread>
+#include <fstream>
 #include <functional> // std::function
 #include <iostream> // runtime_error
 #include <sstream> // ostringstream
-
-// #include <fcntl.h> // make accept non-blocking by returning -1 if no client is waiting
-
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netdb.h> // needed for addrinfo
-#include <netinet/in.h>
-#include <unistd.h>
-#include <arpa/inet.h> // socket()
-#include <openssl/sha.h>
+#include <sys/types.h> // size_t (probably redundant)
+#include <sys/socket.h> // socket(), bind(), accept(), recv(), send()
+#include <netdb.h> // needed for getaddrinfo()
+#include <netinet/in.h> // sockaddr_in
+#include <unistd.h> // close()
+#include <openssl/sha.h> // SHA1()
 
 #define BACKLOG 10
 
 namespace minisocket {
-
-// ---- Minimal base64 encoder (sufficient for handshake) ----
-inline std::string base64_encode(const unsigned char *data, size_t len) {
-    static const char *tbl =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::string out;
-    out.reserve((len+2)/3*4);
-    for (size_t i=0;i<len;i+=3) {
-        int val = (data[i] << 16) +
-                  ((i+1<len)?(data[i+1]<<8):0) +
-                  ((i+2<len)?(data[i+2]):0);
-        out.push_back(tbl[(val>>18)&0x3F]);
-        out.push_back(tbl[(val>>12)&0x3F]);
-        out.push_back((i+1<len)?tbl[(val>>6)&0x3F]:'=');
-        out.push_back((i+2<len)?tbl[(val)&0x3F]:'=');
-    }
-    return out;
-}
-
 
 class Server {
     public:
@@ -96,7 +82,6 @@ class Server {
             // begin listening, allow max 10 connections in incoming queue
             listen(socket_fd, BACKLOG);
         }
-
 
         /*
             accept() [blocking] - check for new clients
@@ -164,7 +149,6 @@ class Server {
             return client_fd;
         }
 
-
         /*
             per thread:
                 in a loop (until browser window closes):
@@ -179,10 +163,10 @@ class Server {
 
             // recv has an internal buffer. The multiple calls are pulling data out of this buffer. It does not 'call' the client
             /*
-            1: First 2 bytes -> base header
-            2: Next 2 or 8 bytes -> extended length (if needed)
-            3: Next 4 bytes -> masking key (if present)
-            4: Remaining N bytes -> payload
+                1: First 2 bytes -> base header
+                2: Next 2 or 8 bytes -> extended length (if needed)
+                3: Next 4 bytes -> masking key (if present)
+                4: Remaining N bytes -> payload
             */
 
             debugLog("    recv() [block]");
@@ -287,6 +271,24 @@ class Server {
             }
         }
 
+        // ---- Minimal base64 encoder (sufficient for handshake) ----
+        std::string base64_encode(const unsigned char *data, size_t len) {
+            static const char *tbl =
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            std::string out;
+            out.reserve((len+2)/3*4);
+            for (size_t i=0;i<len;i+=3) {
+                int val = (data[i] << 16) +
+                        ((i+1<len)?(data[i+1]<<8):0) +
+                        ((i+2<len)?(data[i+2]):0);
+                out.push_back(tbl[(val>>18)&0x3F]);
+                out.push_back(tbl[(val>>12)&0x3F]);
+                out.push_back((i+1<len)?tbl[(val>>6)&0x3F]:'=');
+                out.push_back((i+2<len)?tbl[(val)&0x3F]:'=');
+            }
+            return out;
+        }
+
         void debugLog(std::string msg) {
             std::thread::id tid = std::this_thread::get_id();
             if (isDebug) std::cout << msg << " [" << tid << "]" << std::endl;
@@ -294,9 +296,8 @@ class Server {
 
     private:
         int socket_fd{-1};
-        std::vector<int> client_fds;
         bool isRunning{false};
         bool isDebug{true};
         MessageHandler handler;
-    };
+};
 } // namespace minisocket
