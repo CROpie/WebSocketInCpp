@@ -22,6 +22,10 @@
 #include <unistd.h> // close()
 #include <openssl/sha.h> // SHA1()
 
+// updateAll
+#include <mutex>
+#include <set>
+
 #define BACKLOG 10
 
 namespace minisocket {
@@ -156,80 +160,82 @@ class Server {
                     unmask the payload
                     handler(payload)
         */
-        bool handle_client(int client_fd) {
+        void handle_client(int client_fd) {
             debugLog("  handle_client()");
 
             while (true) {
 
-            // recv has an internal buffer. The multiple calls are pulling data out of this buffer. It does not 'call' the client
-            /*
-                1: First 2 bytes -> base header
-                2: Next 2 or 8 bytes -> extended length (if needed)
-                3: Next 4 bytes -> masking key (if present)
-                4: Remaining N bytes -> payload
-            */
+                // recv has an internal buffer. The multiple calls are pulling data out of this buffer. It does not 'call' the client
+                /*
+                    1: First 2 bytes -> base header
+                    2: Next 2 or 8 bytes -> extended length (if needed)
+                    3: Next 4 bytes -> masking key (if present)
+                    4: Remaining N bytes -> payload
+                */
 
-            debugLog("    recv() [block]");
+                debugLog("    recv() [block]");
 
-            // read the WebSocket frame header
-            unsigned char hdr[2];
-            int flagsRecv = recv(client_fd, hdr, 2, MSG_WAITALL);
-            if (flagsRecv <= 0) break;
+                // read the WebSocket frame header
+                unsigned char hdr[2];
+                int flagsRecv = recv(client_fd, hdr, 2, MSG_WAITALL);
+                if (flagsRecv <= 0) break;
 
-            // hdr[0]: flags (FIN, opcode)
+                // hdr[0]: flags (FIN, opcode)
 
-            // hdr[1]: masking bit + length info
-            // Bit 0: tells if frame is masked. 1: masked, 0:unmasked
-            // Bit 1-7: If 0-125 -> payload length. If 126 next 2 bits are payload length. If 127 next 8 bytes are payload length.
-            // & 0x80 = 10000000 in binary, extracts the mask bit
-            // & 0x7F = 01111111 in binary, extracts the 7-bit payload length
-            bool masked = hdr[1] & 0x80;       // client → server frames are always masked
-            uint64_t len = hdr[1] & 0x7F;      // payload length (7 bits)
+                // hdr[1]: masking bit + length info
+                // Bit 0: tells if frame is masked. 1: masked, 0:unmasked
+                // Bit 1-7: If 0-125 -> payload length. If 126 next 2 bits are payload length. If 127 next 8 bytes are payload length.
+                // & 0x80 = 10000000 in binary, extracts the mask bit
+                // & 0x7F = 01111111 in binary, extracts the 7-bit payload length
+                bool masked = hdr[1] & 0x80;       // client → server frames are always masked
+                uint64_t len = hdr[1] & 0x7F;      // payload length (7 bits)
 
-            if (len==126) {
-                unsigned char ext[2];
-                recv(client_fd, ext, 2, MSG_WAITALL);
-                len = (ext[0]<<8) | ext[1];
-            } else if (len==127) {
-                unsigned char ext[8];
-                recv(client_fd, ext, 8, MSG_WAITALL);
-                len=0;
-                for (int i=0; i<8; ++i) len=(len<<8)|ext[i];
+                if (len==126) {
+                    unsigned char ext[2];
+                    recv(client_fd, ext, 2, MSG_WAITALL);
+                    len = (ext[0]<<8) | ext[1];
+                } else if (len==127) {
+                    unsigned char ext[8];
+                    recv(client_fd, ext, 8, MSG_WAITALL);
+                    len=0;
+                    for (int i=0; i<8; ++i) len=(len<<8)|ext[i];
+                }
+
+                // client-to-server frames are always masked
+                // reads 4-byte masking key
+                unsigned char mask[4];
+                if (masked) recv(client_fd, mask, 4, MSG_WAITALL);
+
+                // reads payload data from the socket (in masked form - if coming from browser)
+                std::string payload(len,'\0'); 
+                int payloadRecv = recv(client_fd, &payload[0], len, MSG_WAITALL);
+                if (payloadRecv <= 0) break;
+
+                // unmask the payload
+                // apply XOR with the mask to get the real message
+                if (masked) for (size_t i=0; i<len; ++i) payload[i]^=mask[i%4];
+        
+                // close frame -> exit loop
+                if (hdr[0]==0x88) break; // close frame
+
+                debugLog("    handler()");
+
+                // 0x81 = FIN + opcode 0x1 (text frame)
+                // call handler with the decoded string
+                if (hdr[0]==0x81 && handler) handler(client_fd, payload);
             }
 
-            // client-to-server frames are always masked
-            // reads 4-byte masking key
-            unsigned char mask[4];
-            if (masked) recv(client_fd, mask, 4, MSG_WAITALL);
-
-            // reads payload data from the socket (in masked form - if coming from browser)
-            std::string payload(len,'\0'); 
-            int payloadRecv = recv(client_fd, &payload[0], len, MSG_WAITALL);
-            if (payloadRecv <= 0) break;
-
-            // unmask the payload
-            // apply XOR with the mask to get the real message
-            if (masked) for (size_t i=0; i<len; ++i) payload[i]^=mask[i%4];
-    
-            // close frame -> exit loop
-            if (hdr[0]==0x88) break; // close frame
-
-            debugLog("    handler()");
-
-            // 0x81 = FIN + opcode 0x1 (text frame)
-            // call handler with the decoded string
-            if (hdr[0]==0x81 && handler) handler(client_fd, payload);
-            }
             debugLog("    returning from handle_client()");
-            return true;
+            remove_client(client_fd);
         }
 
         /*
             to be used in the (user-created) handler function
             translate string to be ready to be sent via sockets
+            sendFrameToAll() to be used for global updates
             send()
         */
-        void sendFrame(int client_fd, const std::string& msg) {
+        std::string generateFrame(const std::string& msg) {
             std::string frame;
             frame.push_back(0x81); // FIN + text
 
@@ -244,7 +250,19 @@ class Server {
                 for (int i=7;i>=0;--i) frame.push_back((msg.size()>>(8*i))&0xFF);
             }
             frame += msg;
+            return frame;
+        }
+
+        void sendFrame(int client_fd, const std::string& msg) {
+            std::string frame = generateFrame(msg);
             send(client_fd, frame.data(), frame.size(), 0);
+        }
+
+        void sendFrameToAll(const std::string& msg) {
+            std::string frame = generateFrame(msg);
+            for (int client_fd : clients) {
+                send(client_fd, frame.data(), frame.size(), 0);
+            }
         }
 
         void stop() {
@@ -252,6 +270,19 @@ class Server {
             if (socket_fd >= 0) close(socket_fd);
         }
 
+        // mutex: mutual exclusion. Ensure only one thread at a time can access a resource
+        void add_client(int client_fd) {
+            std::lock_guard<std::mutex> lock(clients_mutex);
+            clients.insert(client_fd);
+        }
+
+        void remove_client(int client_fd) {
+            std::lock_guard<std::mutex> lock(clients_mutex);
+            clients.erase(client_fd);          
+        }
+
+
+        void updateAll() {};
         /*
             main loop
                 run accept_new_client(), which will block at 'accept' until a connection is made
@@ -264,6 +295,7 @@ class Server {
             isRunning = true;
             while (isRunning) {
                 int client_fd = accept_new_client();
+                add_client(client_fd);
                 std::thread([this, client_fd]() {
                     handle_client(client_fd);
                     debugLog("  detaching thread in run()");
@@ -299,5 +331,8 @@ class Server {
         bool isRunning{false};
         bool isDebug{true};
         MessageHandler handler;
+
+        std::mutex clients_mutex;
+        std::set<int> clients;
 };
 } // namespace minisocket
