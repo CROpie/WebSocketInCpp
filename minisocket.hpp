@@ -1,6 +1,7 @@
 /*
 
     Minimal server-side websocket implementation using threads to handle multiple clients
+    Version: 1.1.0
     Requires -lcrypto
     https://github.com/CROpie/WebSocketInCpp
 
@@ -31,8 +32,26 @@
 namespace minisocket {
 
 class Server {
+    private:
+    int socket_fd{-1};
+    bool isRunning{false};
+    bool isDebug{true};
+
+    std::mutex clients_mutex;
+    std::set<int> clients;
+
+    struct Frame {
+        bool fin;
+        uint8_t opcode;
+        bool masked;
+        uint64_t length;
+        unsigned char mask[4];
+        std::string payload;
+    };
+
     public:
-        using MessageHandler = std::function<void(int client, const std::string&)>;
+        std::function<void(int client_fd, const std::string& payload)> on_message;
+        std::function<void(int)> on_disconnect;
 
         /*
             Function made up of the following:
@@ -42,18 +61,12 @@ class Server {
                 bind() - attach the socket to the port
                 listen() - mark as a passive socket ready to accept connections
         */
-        void init(const char* port, MessageHandler handler, bool isDebug = false) {
-            this->isDebug = isDebug;
-            debugLog("init()");
-
-            this->handler = handler;
+        void init(const char* port) {
 
             struct addrinfo hints{}, *res;
             hints.ai_family = AF_UNSPEC; // use IPv4 or IPv6, whichever
             hints.ai_socktype = SOCK_STREAM;
             hints.ai_flags = AI_PASSIVE; // for binding (fill in IP for me)
-
-            debugLog("  getaddrinfo()");
 
             // load up address structs
             // NULL will bind all local IP addresses (0,0,0,0)
@@ -61,58 +74,25 @@ class Server {
                 throw std::runtime_error("getaddrinfo error");
             };
 
-            debugLog("  socket()");
-  
             // make a socket
             socket_fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
             if (socket_fd == -1) throw std::runtime_error("socket error");
-
-            debugLog("  setsockopt()");
 
             // allow other sockets to bind() to this port
             // (get around address already in use error messages when try to restart server after a crash)
             int yes = 1;
             setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
-            debugLog("  bind()");
-
             // bind it to the port we passed in to getaddrinfo
             if (bind(socket_fd, res->ai_addr, res->ai_addrlen) == -1) {
                 throw std::runtime_error("bind error");
             }
 
-            debugLog("  listen()");
-
             // begin listening, allow max 10 connections in incoming queue
             listen(socket_fd, BACKLOG);
         }
 
-        /*
-            accept() [blocking] - check for new clients
-            perform handshake
-            => client_fd
-        */
-        int accept_new_client() {
-            debugLog("  accept_new_client()");
-            struct sockaddr_storage their_addr;
-            socklen_t addr_size = sizeof their_addr;
-
-            debugLog("    accept() [block]");
-
-            int client_fd = accept(socket_fd, (struct sockaddr *)&their_addr, &addr_size);
-            if (client_fd == -1)  throw std::runtime_error("accept error");
-
-            char buffer[1024];
-            std::string incoming;
-
-            while (incoming.find("\r\n\r\n") == std::string::npos) {
-                int n = recv(client_fd, buffer, sizeof(buffer), 0);
-                if (n <= 0) throw std::runtime_error("connection closed before handshake complete");
-                incoming.append(buffer, n);
-            }
-
-            // std::cout << "incoming: " << incoming << std::endl;
-
+        std::ostringstream generateHandshakeResponse(int client_fd, std::string incoming) {
             // --- HTTP Upgrade (handshake) ---
             auto key_pos = incoming.find("Sec-WebSocket-Key:");
             if (key_pos==std::string::npos) { 
@@ -142,9 +122,32 @@ class Server {
                 << "Connection: Upgrade\r\n"
                 << "Sec-WebSocket-Accept: " << accept_key << "\r\n\r\n";
 
-            // std::cout << "response: " << resp.str() << std::endl;
+            return resp;
+        }
 
-            debugLog("    send()");
+        /*
+            accept() [blocking] - check for new clients
+            perform handshake
+            => client_fd
+        */
+        int accept_new_client() {
+            struct sockaddr_storage their_addr;
+            socklen_t addr_size = sizeof their_addr;
+
+            int client_fd = accept(socket_fd, (struct sockaddr *)&their_addr, &addr_size);
+
+            if (client_fd == -1)  throw std::runtime_error("accept error");
+
+            char buffer[1024];
+            std::string incoming;
+
+            while (incoming.find("\r\n\r\n") == std::string::npos) {
+                int n = recv(client_fd, buffer, sizeof(buffer), 0);
+                if (n <= 0) throw std::runtime_error("connection closed before handshake complete");
+                incoming.append(buffer, n);
+            }
+
+            std::ostringstream resp = generateHandshakeResponse(client_fd, incoming);
 
             send(client_fd, resp.str().c_str(), resp.str().size(), 0);
 
@@ -153,80 +156,100 @@ class Server {
             return client_fd;
         }
 
+        // Extract header from recv stream, insert values into Frame struct. determine the payload length from header
+        bool read_header(int client_fd, Frame& frame) {
+            // read first 2 bytes of recv stream which is the WebSocket frame header
+            // Byte 0 (hdr[0]): FIN | RSV1 | RSV2 | RSV3 | OPCODE (1 | 1 | 1 | 1 | 4 bits)
+            // Byte 1 (hdr[1]): MASK | Payload length (1 | 7 bits)
+            unsigned char hdr[2];
+
+            if (recv(client_fd, hdr, 2, MSG_WAITALL) <= 0) return false;
+
+            frame.fin = hdr[0] & 0x80; // 1000 0000 => check FIN bit. 1: final frame. 0: more frames are coming.
+            frame.opcode = hdr[0] & 0x0F; // 0000 1111 => extract opcode
+
+            frame.masked = hdr[1] & 0x80; // 1000 0000 => check MASK: 1: client-> server
+            frame.length = hdr[1] & 0x7F; // 0111 1111 => get payload length
+
+
+            // Bit 1-7: If 0-125 -> payload length. If 126 next 2 bits are payload length. If 127 next 8 bytes are payload length.
+            if (frame.length == 126) {
+                unsigned char ext[2];
+                if (recv(client_fd, ext, 2, MSG_WAITALL) <= 0) return false;
+                frame.length = (ext[0] << 8) | ext[1];
+            } else if (frame.length == 127) {
+                unsigned char ext[8];
+                if (recv(client_fd, ext, 8, MSG_WAITALL) <= 0) return false;
+                frame.length = 0;
+                for (int i = 0; i < 8; ++i) frame.length = (frame.length << 8) | ext[i];
+            }
+            return true;
+        }
+
+        // Pull masking key out of the recv stream (if it exists)
+        bool read_mask(int client_fd, Frame& frame) {
+            if (frame.masked) {
+                if (recv(client_fd, frame.mask, 4, MSG_WAITALL) <= 0) return false;
+            }
+            return true;
+        }
+
+        bool read_payload(int client_fd, Frame& frame) {
+            frame.payload.resize(frame.length);
+
+            // reads payload data from the socket in masked form
+            if (recv(client_fd, &frame.payload[0], frame.length, MSG_WAITALL) <= 0) return false;
+
+
+            // unmask the payload by applying XOR with the mask to get the real message
+            if (frame.masked) {
+                for (size_t i = 0; i < frame.length; ++i) {
+                    frame.payload[i] ^= frame.mask[i % 4];
+                }
+            }
+            return true;
+
+        }
+
         /*
             per thread:
                 in a loop (until browser window closes):
                     recv() [blocking] - wait for a message (payload) from the client
-                    unmask the payload
-                    handler(payload)
+                    pull the payload from recv stream
+                    send to function created by user of minisocket so they can choose what to do with it
         */
         void handle_client(int client_fd) {
-            debugLog("  handle_client()");
 
+            Frame frame;
+            
             while (true) {
-
-                // recv has an internal buffer. The multiple calls are pulling data out of this buffer. It does not 'call' the client
                 /*
+                    recv has an internal buffer. The multiple recv calls are pulling data out of this buffer.
+                    It does not 'call' the client each time
+
                     1: First 2 bytes -> base header
                     2: Next 2 or 8 bytes -> extended length (if needed)
                     3: Next 4 bytes -> masking key (if present)
                     4: Remaining N bytes -> payload
                 */
+               if (!read_header(client_fd, frame)) break;
+               if (!read_mask(client_fd, frame)) break;
+               if (!read_payload(client_fd, frame)) break;
 
-                debugLog("    recv() [block]");
-
-                // read the WebSocket frame header
-                unsigned char hdr[2];
-                int flagsRecv = recv(client_fd, hdr, 2, MSG_WAITALL);
-                if (flagsRecv <= 0) break;
-
-                // hdr[0]: flags (FIN, opcode)
-
-                // hdr[1]: masking bit + length info
-                // Bit 0: tells if frame is masked. 1: masked, 0:unmasked
-                // Bit 1-7: If 0-125 -> payload length. If 126 next 2 bits are payload length. If 127 next 8 bytes are payload length.
-                // & 0x80 = 10000000 in binary, extracts the mask bit
-                // & 0x7F = 01111111 in binary, extracts the 7-bit payload length
-                bool masked = hdr[1] & 0x80;       // client → server frames are always masked
-                uint64_t len = hdr[1] & 0x7F;      // payload length (7 bits)
-
-                if (len==126) {
-                    unsigned char ext[2];
-                    recv(client_fd, ext, 2, MSG_WAITALL);
-                    len = (ext[0]<<8) | ext[1];
-                } else if (len==127) {
-                    unsigned char ext[8];
-                    recv(client_fd, ext, 8, MSG_WAITALL);
-                    len=0;
-                    for (int i=0; i<8; ++i) len=(len<<8)|ext[i];
-                }
-
-                // client-to-server frames are always masked
-                // reads 4-byte masking key
-                unsigned char mask[4];
-                if (masked) recv(client_fd, mask, 4, MSG_WAITALL);
-
-                // reads payload data from the socket (in masked form - if coming from browser)
-                std::string payload(len,'\0'); 
-                int payloadRecv = recv(client_fd, &payload[0], len, MSG_WAITALL);
-                if (payloadRecv <= 0) break;
-
-                // unmask the payload
-                // apply XOR with the mask to get the real message
-                if (masked) for (size_t i=0; i<len; ++i) payload[i]^=mask[i%4];
-        
                 // close frame -> exit loop
-                if (hdr[0]==0x88) break; // close frame
+               if (frame.opcode == 0x8) break;
 
-                debugLog("    handler()");
-
-                // 0x81 = FIN + opcode 0x1 (text frame)
-                // call handler with the decoded string
-                if (hdr[0]==0x81 && handler) handler(client_fd, payload);
+                // text frame -> call handler function (if it has been passed in to minisocket)
+               if (frame.opcode == 0x1) {
+                if (on_message) on_message(client_fd, frame.payload);
+               }
             }
 
-            debugLog("    returning from handle_client()");
+            // out of the loop means socket connection has broken (intentional or otherwise)
+            // if a disconnect function is passed in by the user of minisocket, run it
+            if (on_disconnect) on_disconnect(client_fd);
             remove_client(client_fd);
+            close(client_fd);
         }
 
         /*
@@ -278,11 +301,9 @@ class Server {
 
         void remove_client(int client_fd) {
             std::lock_guard<std::mutex> lock(clients_mutex);
-            clients.erase(client_fd);          
+            clients.erase(client_fd);
         }
 
-
-        void updateAll() {};
         /*
             main loop
                 run accept_new_client(), which will block at 'accept' until a connection is made
@@ -291,14 +312,12 @@ class Server {
                 closing the browser window will return from handle_client and detach that thread
         */
         void run() {
-            debugLog("run()");
             isRunning = true;
             while (isRunning) {
                 int client_fd = accept_new_client();
                 add_client(client_fd);
                 std::thread([this, client_fd]() {
                     handle_client(client_fd);
-                    debugLog("  detaching thread in run()");
                 }).detach();
             }
         }
@@ -321,18 +340,6 @@ class Server {
             return out;
         }
 
-        void debugLog(std::string msg) {
-            std::thread::id tid = std::this_thread::get_id();
-            if (isDebug) std::cout << msg << " [" << tid << "]" << std::endl;
-        }
 
-    private:
-        int socket_fd{-1};
-        bool isRunning{false};
-        bool isDebug{true};
-        MessageHandler handler;
-
-        std::mutex clients_mutex;
-        std::set<int> clients;
 };
 } // namespace minisocket
